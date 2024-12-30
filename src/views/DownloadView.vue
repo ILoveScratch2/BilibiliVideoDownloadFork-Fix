@@ -31,6 +31,12 @@
               <div class="reload" v-if="Number(value.status)===STATUS.FAIL" @click="reloadBtnClick(key)">
                 <ReloadOutlined />
               </div>
+              <div class="pause" v-if="Number(value.status)===STATUS.VIDEO_DOWNLOADING" @click="pauseDownload(value)">
+                <PauseOutlined />
+              </div>
+              <div class="resume" v-if="Number(value.status)===STATUS.PAUSED" @click="resumeDownload(value)">
+                <CaretRightOutlined />
+              </div>
             </div>
           </div>
         </div>
@@ -69,7 +75,7 @@ import { storeToRefs } from 'pinia'
 import { store } from '../store'
 import { qualityMap } from '../assets/data/quality'
 import { checkUrl, checkUrlRedirect, parseHtml, getDownloadList, addDownload } from '../core/bilibili'
-import { ReloadOutlined, ClearOutlined } from '@ant-design/icons-vue'
+import { ReloadOutlined, ClearOutlined, PauseOutlined, CaretRightOutlined } from '@ant-design/icons-vue'
 
 const { taskList, rightTask, taskListArray, rightTaskId } = storeToRefs(store.taskStore())
 const selected = ref<string[]>([])
@@ -261,6 +267,22 @@ function showCleanConfirm () {
   })
 }
 
+const pauseDownload = async (task: TaskData) => {
+  const { ipcRenderer } = window.electron
+  const result = await ipcRenderer.invoke('pause-download', task.id)
+  if (result) {
+    task.status = STATUS.PAUSED
+  }
+}
+
+const resumeDownload = async (task: TaskData) => {
+  const { ipcRenderer } = window.electron
+  const result = await ipcRenderer.invoke('resume-download', task)
+  if (result) {
+    task.status = STATUS.VIDEO_DOWNLOADING
+  }
+}
+
 onMounted(() => {
   if (!rightTaskId.value) return
   switchItem(rightTaskId.value)
@@ -332,6 +354,16 @@ function reloadBtnClick (key: string) {
           width: 100%;
         }
         .reload {
+          width: 20px;
+          text-align: center;
+          color: rgb(251, 114, 153);
+        }
+        .pause {
+          width: 20px;
+          text-align: center;
+          color: rgb(251, 114, 153);
+        }
+        .resume {
           width: 20px;
           text-align: center;
           color: rgb(251, 114, 153);

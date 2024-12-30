@@ -14,28 +14,38 @@ const fs = require('fs-extra')
 const got = require('got')
 const pipeline = promisify(stream.pipeline)
 
-function handleDeleteFile (setting: SettingData, videoInfo: TaskData) {
-  // 删除原视频
-  if (setting.isDelete) {
-    const filePathList = videoInfo.filePathList
-    fs.removeSync(filePathList[2])
-    fs.removeSync(filePathList[3])
+// 新增暂停和恢复的全局状态管理
+const downloadStates: { [key: string]: { 
+  isPaused: boolean, 
+  resumeDownload: () => Promise<void> | null 
+} } = {}
+
+export const pauseDownload = (taskId: string) => {
+  if (downloadStates[taskId]) {
+    downloadStates[taskId].isPaused = true
+    return true
   }
+  return false
+}
+
+export const resumeDownload = async (taskId: string, videoInfo: TaskData, event: IpcMainEvent, setting: SettingData) => {
+  if (downloadStates[taskId] && downloadStates[taskId].resumeDownload) {
+    await downloadStates[taskId].resumeDownload()
+    return true
+  }
+  return false
 }
 
 export default async (videoInfo: TaskData, event: IpcMainEvent, setting: SettingData) => {
+  const taskId = videoInfo.id
+  downloadStates[taskId] = { 
+    isPaused: false, 
+    resumeDownload: null 
+  }
+
   log.info(videoInfo.id, videoInfo.title)
   const takeInfo = store.get(`taskList.${videoInfo.id}`)
   log.info('mainStore', takeInfo, takeInfo && takeInfo.status)
-  // if (takeInfo && takeInfo.status === STATUS.FAIL) {
-  //   log.error('×××××!!!!!已经失败过的内容')
-  // }
-  // if (takeInfo && takeInfo.status === STATUS.COMPLETED) {
-  //   log.error('×××××已经下载过的内容')
-  // }
-  // if (videoInfo.status === STATUS.FAIL) {
-  //   log.error('已经失败的,又再次下载', videoInfo.title)
-  // }
 
   const updateData = {
     id: videoInfo.id,
@@ -48,10 +58,7 @@ export default async (videoInfo: TaskData, event: IpcMainEvent, setting: Setting
     ...updateData
   })
 
-  // 去掉扩展名的文件路径
   const fileName = videoInfo.filePathList[0].substring(0, videoInfo.filePathList[0].length - 4)
-  // if (setting.isFolder) {
-  // 创建文件夹 存在多p视频时 设置关闭了 下载到单独的文件时 也会需插件合集的目录
   try {
     if (!fs.existsSync(videoInfo.fileDir)) {
       fs.mkdirSync(`${videoInfo.fileDir}`, {
@@ -64,8 +71,8 @@ export default async (videoInfo: TaskData, event: IpcMainEvent, setting: Setting
   } catch (error) {
     log.error(`创建文件夹失败：${error}`)
   }
-  // }
-  // 下载封面
+
+  // 下载封面和字幕逻辑保持不变
   if (setting.isCover) {
     const imageConfig = {
       headers: {
@@ -84,7 +91,6 @@ export default async (videoInfo: TaskData, event: IpcMainEvent, setting: Setting
   }
 
   log.info(`下载字幕 "${JSON.stringify(videoInfo.subtitle)}"`)
-  // 下载字幕
   if (setting.isSubtitle &&
     Array.isArray(videoInfo.subtitle) &&
     videoInfo.subtitle.length > 0) {
@@ -92,7 +98,6 @@ export default async (videoInfo: TaskData, event: IpcMainEvent, setting: Setting
     log.info(`✅ 下载字幕完成 ${videoInfo.title}`)
   }
 
-  // 下载弹幕
   if (setting.isDanmaku) {
     event.reply('download-danmuku', videoInfo.cid, videoInfo.title, `${fileName}.ass`)
   }
@@ -104,87 +109,124 @@ export default async (videoInfo: TaskData, event: IpcMainEvent, setting: Setting
     },
     cookie: `SESSDATA=${setting.SESSDATA}`
   }
-  function videoProgressNotify (progress: any) {
-    const updateData = {
-      id: videoInfo.id,
-      status: STATUS.VIDEO_DOWNLOADING,
-      progress: Math.round(progress.percent * 100 * 0.75)
-    }
-    // console.log('id', videoInfo.id, Math.round(progress.percent * 100 * 0.75))
-    event.reply('download-video-status', updateData)
-    store.set(`taskList.${videoInfo.id}`, Object.assign(videoInfo, updateData))
-    //   {
-    //   ...videoInfo,
-    //   ...updateData
-    // })
-  }
-  // 下载视频
-  await pipeline(
-    got.stream(videoInfo.downloadUrl.video, downloadConfig)
-      .on('downloadProgress', throttle(videoProgressNotify, 1000))
-      .on('error', async (error: any) => {
-        log.error(`视频下载失败：${videoInfo.title}--${error.message}`)
-        log.error(`------${videoInfo.downloadUrl.video}, ${JSON.stringify(downloadConfig)}`)
+
+  // 视频下载支持暂停和恢复
+  const videoDownloadPromise = new Promise<void>(async (resolve, reject) => {
+    const videoStream = got.stream(videoInfo.downloadUrl.video, downloadConfig)
+    const writeStream = fs.createWriteStream(videoInfo.filePathList[2])
+
+    let downloadedBytes = 0
+    let totalBytes = 0
+
+    videoStream.on('response', (response) => {
+      totalBytes = parseInt(response.headers['content-length'] || '0', 10)
+    })
+
+    videoStream.on('data', (chunk) => {
+      if (downloadStates[taskId].isPaused) {
+        videoStream.pause()
+      }
+      downloadedBytes += chunk.length
+    })
+
+    videoStream.on('error', (error) => {
+      log.error(`视频下载失败：${videoInfo.title}--${error.message}`)
+      const updateData = {
+        id: videoInfo.id,
+        status: STATUS.FAIL
+      }
+      store.set(`taskList.${videoInfo.id}`, Object.assign(videoInfo, updateData))
+      event.reply('download-video-status', updateData)
+      reject(error)
+    })
+
+    writeStream.on('error', (error) => {
+      reject(error)
+    })
+
+    downloadStates[taskId].resumeDownload = async () => {
+      if (downloadStates[taskId].isPaused) {
         const updateData = {
           id: videoInfo.id,
-          status: STATUS.FAIL
+          status: STATUS.VIDEO_DOWNLOADING,
+          progress: Math.round((downloadedBytes / totalBytes) * 100 * 0.75)
         }
-        // store.set(`taskList.${videoInfo.id}`, {
-        //   ...videoInfo,
-        //   ...updateData
-        // })
-        store.set(`taskList.${videoInfo.id}`, Object.assign(videoInfo, updateData))
-        // 防止最后一次节流把错误状态给覆盖掉
-        await sleep(500)
         event.reply('download-video-status', updateData)
-      }),
-    fs.createWriteStream(videoInfo.filePathList[2])
-  )
-
-  log.info(`✅ 下载视频完成 ${videoInfo.title}`)
-
-  await sleep(1000)
-
-  function audioProgressNotify (progress: any) {
-    const updateData = {
-      id: videoInfo.id,
-      status: STATUS.AUDIO_DOWNLOADING,
-      progress: Math.round((progress.percent * 100 * 0.22) + 75)
+        store.set(`taskList.${videoInfo.id}`, Object.assign(videoInfo, updateData))
+        downloadStates[taskId].isPaused = false
+        videoStream.resume()
+      }
     }
-    event.reply('download-video-status', updateData)
-    store.set(`taskList.${videoInfo.id}`, Object.assign(videoInfo, updateData))
-    // store.set(`taskList.${videoInfo.id}`, {
-    //   ...videoInfo,
-    //   ...updateData
-    // })
-  }
 
-  // 下载音频
-  await pipeline(
-    got.stream(videoInfo.downloadUrl.audio, downloadConfig)
-      .on('downloadProgress', throttle(audioProgressNotify, 1000))
-      .on('error', async (error: any) => {
-        log.error(`音频下载失败：${videoInfo.title} ${error.message}`)
+    videoStream.pipe(writeStream)
+
+    writeStream.on('finish', () => {
+      log.info(`✅ 下载视频完成 ${videoInfo.title}`)
+      resolve()
+    })
+  })
+
+  await videoDownloadPromise
+
+  // 音频下载同样支持暂停和恢复
+  const audioDownloadPromise = new Promise<void>(async (resolve, reject) => {
+    const audioStream = got.stream(videoInfo.downloadUrl.audio, downloadConfig)
+    const writeStream = fs.createWriteStream(videoInfo.filePathList[3])
+
+    let downloadedBytes = 0
+    let totalBytes = 0
+
+    audioStream.on('response', (response) => {
+      totalBytes = parseInt(response.headers['content-length'] || '0', 10)
+    })
+
+    audioStream.on('data', (chunk) => {
+      if (downloadStates[taskId].isPaused) {
+        audioStream.pause()
+      }
+      downloadedBytes += chunk.length
+    })
+
+    audioStream.on('error', (error) => {
+      log.error(`音频下载失败：${videoInfo.title} ${error.message}`)
+      const updateData = {
+        id: videoInfo.id,
+        status: STATUS.FAIL
+      }
+      store.set(`taskList.${videoInfo.id}`, Object.assign(videoInfo, updateData))
+      event.reply('download-video-status', updateData)
+      reject(error)
+    })
+
+    writeStream.on('error', (error) => {
+      reject(error)
+    })
+
+    downloadStates[taskId].resumeDownload = async () => {
+      if (downloadStates[taskId].isPaused) {
         const updateData = {
           id: videoInfo.id,
-          status: STATUS.FAIL
+          status: STATUS.AUDIO_DOWNLOADING,
+          progress: Math.round((downloadedBytes / totalBytes) * 100 * 0.22 + 75)
         }
-        store.set(`taskList.${videoInfo.id}`, Object.assign(videoInfo, updateData))
-        // store.set(`taskList.${videoInfo.id}`, {
-        //   ...videoInfo,
-        //   ...updateData
-        // })
-        // 防止最后一次节流把错误状态给覆盖掉
-        await sleep(500)
         event.reply('download-video-status', updateData)
-      }),
-    fs.createWriteStream(videoInfo.filePathList[3])
-  )
-  log.info(`✅ 下载下载音频 ${videoInfo.title}`)
+        store.set(`taskList.${videoInfo.id}`, Object.assign(videoInfo, updateData))
+        downloadStates[taskId].isPaused = false
+        audioStream.resume()
+      }
+    }
 
-  await sleep(1000)
+    audioStream.pipe(writeStream)
 
-  // 合成视频
+    writeStream.on('finish', () => {
+      log.info(`✅ 下载音频 ${videoInfo.title}`)
+      resolve()
+    })
+  })
+
+  await audioDownloadPromise
+
+  // 合成视频逻辑保持不变
   if (setting.isMerge) {
     const updateData = {
       id: videoInfo.id,
@@ -226,6 +268,14 @@ export default async (videoInfo: TaskData, event: IpcMainEvent, setting: Setting
       })
     } finally {
       // 删除原视频
+      const handleDeleteFile = (setting: SettingData, videoInfo: TaskData) => {
+        // 删除原视频
+        if (setting.isDelete) {
+          const filePathList = videoInfo.filePathList
+          fs.removeSync(filePathList[2])
+          fs.removeSync(filePathList[3])
+        }
+      }
       handleDeleteFile(setting, videoInfo)
     }
   } else {
@@ -239,6 +289,14 @@ export default async (videoInfo: TaskData, event: IpcMainEvent, setting: Setting
       ...videoInfo,
       ...updateData
     })
+    const handleDeleteFile = (setting: SettingData, videoInfo: TaskData) => {
+      // 删除原视频
+      if (setting.isDelete) {
+        const filePathList = videoInfo.filePathList
+        fs.removeSync(filePathList[2])
+        fs.removeSync(filePathList[3])
+      }
+    }
     handleDeleteFile(setting, videoInfo)
   }
 }

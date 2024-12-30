@@ -82,3 +82,28 @@ contextBridge.exposeInMainWorld('electron', {
     }
   }
 })
+
+const { ipcRenderer } = require('electron')
+const { download } = require('./core/download')
+
+// 暂停下载
+ipcRenderer.handle('pause-download', async (event, taskId) => {
+  try {
+    const downloadModule = await import('./core/download')
+    return downloadModule.pauseDownload(taskId)
+  } catch (error) {
+    console.error('Pause download error:', error)
+    return false
+  }
+})
+
+// 恢复下载
+ipcRenderer.handle('resume-download', async (event, task) => {
+  try {
+    const downloadModule = await import('./core/download')
+    return await downloadModule.resumeDownload(task.id, task, event, await ipcRenderer.invoke('get-setting'))
+  } catch (error) {
+    console.error('Resume download error:', error)
+    return false
+  }
+})
